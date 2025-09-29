@@ -1,0 +1,165 @@
+Test 1 — Search Slots
+Request
+Method: GET
+URL: http://localhost:8087/crs/search?serviceType=MRI
+Headers: Accept: application/json
+Expected HTTP: 200
+Example body (what you gave):
+[ { "id": 1, "serviceType": "MRI", "slotTime": "2025-09-26T10:00:00", "status": "available", "centreId": "DC008", "centreName": "Apollo Diagnostics" }, { "id": 1, "serviceType": "MRI", "slotTime": "2025-09-26T11:00:00", "status": "available", "centreId": "DC009", "centreName": "Fortis Labs" }, { "id": 2, "serviceType": "MRI", "slotTime": "2025-09-26T14:00:00", "status": "available", "centreId": "DC008", "centreName": "Apollo Diagnostics" } ]
+Postman Tests script (paste to Tests tab):
+
+pm.test("Status 200", () => pm.response.to.have.status(200));
+const slots = pm.response.json();
+pm.test("Body is non-empty array", () => pm.expect(slots).to.be.an('array').that.is.not.empty);
+pm.test("Each slot has required fields and status available", () => {
+  slots.forEach(s => {
+    pm.expect(s).to.have.property('id');
+    pm.expect(s).to.have.property('serviceType', 'MRI');
+    pm.expect(s).to.have.property('slotTime');
+    pm.expect(new Date(s.slotTime).toString()).to.not.equal('Invalid Date');
+    pm.expect(s).to.have.property('status');
+    pm.expect(s.status.toLowerCase()).to.equal('available');
+    pm.expect(s).to.have.property('centreId');
+    pm.expect(s).to.have.property('centreName');
+  });
+});
+Optional DB verification (psql):
+
+docker exec -it crs-postgres psql -U crsuser -d central_reservation \
+  -c "SELECT id, centerid, slotdate, slottime, status FROM availabilityslots WHERE serviceid=(SELECT id FROM imagingservices WHERE name='MRI') LIMIT 10;"
+(Verify rows and status='AVAILABLE') 
+2
+.
+Test 2 — Lock Slot (temporary reservation)
+Purpose: reserve the chosen slot; server must return lockId/bookingId/paymentId and status LOCKED.
+Request
+Method: POST
+URL: http://localhost:8087/crs/slot/lock
+Headers: Content-Type: application/json
+Body:
+
+{
+  "centerId": "DC009",
+  "slotId": 1,
+  "serviceType": "MRI",
+  "slotTime": "2025-09-26T11:00:00"
+}
+Expected HTTP: 200
+Expected response body fields (example you provided):
+
+{
+  "id": 15,
+  "bookingId": "525b2395-a1e5-4239-b308-4013343cc696",
+  "lockId": "071dbeeb-4f16-4d14-96af-0f743b6126c5",
+  "centerId": "DC009",
+  "slotTime": "2025-09-26T11:00:00",
+  "status": "LOCKED",
+  "paymentId": "613ef30f-8e6a-486e-9362-a80bdca9280d",
+  "createdAt": "2025-09-29T10:21:57.9233883"
+}
+Postman Tests script (Tests tab). This also stores env vars for later tests:
+
+pm.test("Status 200", () => pm.response.to.have.status(200));
+const b = pm.response.json();
+pm.test("Has lockId/bookingId and status LOCKED", () => {
+  pm.expect(b).to.have.property('lockId').that.is.a('string');
+  pm.expect(b).to.have.property('bookingId').that.is.a('string');
+  pm.expect(b).to.have.property('status', 'LOCKED');
+});
+pm.environment.set('bookingId', b.bookingId);
+pm.environment.set('lockId', b.lockId);
+pm.environment.set('paymentId', b.paymentId);
+pm.environment.set('lockedSlotId', 1);
+pm.environment.set('lockedCentreId', b.centerId);
+Follow‑up verification (GET search or DB)
+Re-run search for the center/date and assert the slot shows status LOCKED or RESERVED:
+GET http://localhost:8087/crs/search?serviceType=MRI&centreId=DC009&date=2025-09-26
+Expect the slotTime 2025-09-26T11:00:00 to have status "LOCKED" or "reserved".
+DB check (psql) to assert reservation fields:
+
+docker exec -it crs-postgres psql -U crsuser -d central_reservation \
+  -c "SELECT id, status, reservedfor, reserveduntil FROM availabilityslots WHERE id=1;"
+Expect status = 'RESERVED'/'LOCKED' and reservedfor equals the booking/patient id per your implementation 
+3
+ 
+2
+.
+Concurrency check (manual)
+Send 2 simultaneous POST lock requests for same slot; expect one success, one conflict (409) or an error indicating slot not available (the repository reserveSlot method enforces conditional update) 
+3
+.
+Test 3 — Payment Failure → Release Slot
+Purpose: simulate payment failure webhook and verify slot becomes available again.
+Request
+Method: POST
+URL: http://localhost:8087/crs/payment/webhook
+Headers: Content-Type: application/json
+Body:
+
+{
+  "paymentId": "{{paymentId}}",
+  "status": "FAILURE",
+  "bookingId": "{{bookingId}}"
+}
+Expected HTTP: 200
+Expected response body/text: "Booking released" (as in your sample).
+Postman Tests (Tests tab):
+
+pm.test("Status 200", () => pm.response.to.have.status(200));
+pm.test("Body indicates release", () => {
+  const text = pm.response.text().toLowerCase();
+  pm.expect(text).to.include('release');
+});
+Verification
+GET search for the same centre/date and assert the slotTime = 2025-09-26T11:00:00 now has status "available".
+DB check:
+
+docker exec -it crs-postgres psql -U crsuser -d central_reservation \
+  -c "SELECT id, status, reservedfor FROM availabilityslots WHERE id=1;"
+Expect status = 'AVAILABLE' and reservedfor IS NULL (reservation has been cleared) 
+3
+ 
+5
+.
+Replay/Idempotency check: re-send same FAILURE payload; system should not error or double‑release — booking already released behavior should be idempotent (PaymentService/consumer logic must handle duplicates) 
+4
+.
+Test 4 — Payment Success → Confirm Booking
+Purpose: simulate successful payment and confirm booking; slot status should become BOOKED/CONFIRMED.
+Request
+Method: POST
+URL: http://localhost:8087/crs/payment/webhook
+Headers: Content-Type: application/json
+Body:
+
+{
+  "paymentId": "{{paymentId}}",
+  "status": "SUCCESS",
+  "bookingId": "{{bookingId}}",
+  "amount": 150.00
+}
+Expected HTTP: 200
+Expected response: text "Booking confirmed" or JSON { message: "Booking confirmed" } (your sample: "Booking confirmed").
+Postman Tests:
+
+pm.test("Status 200", () => pm.response.to.have.status(200));
+pm.test("Body indicates confirmation", () => {
+  const text = pm.response.text().toLowerCase();
+  pm.expect(text).to.include('confirm');
+});
+Verification
+GET search for same centre/date → the slotTime should now show status "booked" or "confirmed".
+DB checks:
+
+docker exec -it crs-postgres psql -U crsuser -d central_reservation \
+  -c "SELECT id, status FROM availabilityslots WHERE id=1;"
+docker exec -it crs-postgres psql -U crsuser -d central_reservation \
+  -c "SELECT id, status, transactionid FROM paymenttransactions WHERE id = '<paymentId>' OR transactionid = '<paymentId>';"
+Expect availability slot status BOOKED/CONFIRMED and payment transaction recorded as SUCCESS/COMPLETED 
+4
+ 
+3
+.
+Duplicate webhook check: re-post SUCCESS; system must be idempotent — existing booking should remain booked and payment processing should not create duplicates 
+4
+.
